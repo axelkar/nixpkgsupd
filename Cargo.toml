@@ -1,0 +1,21 @@
+[package]
+name = "nixpkgsupd"
+version = "0.1.0"
+authors = ["Axel Karjalainen <axel@axka.fi>"]
+edition = "2021"
+description = "Nix garbage collector root flake updater"
+readme = "README.md"
+repository = "https://github.com/axelkar/nixpkgsupd"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+clap = "4.5.23"
+color-eyre = { version = "0.6.3", default-features = false, features = ["track-caller"] }
+diff = "0.1.13"
+dirs = "5.0.1"
+fs-err = { version = "3.0.0", features = ["expose_original_error"] }
+itertools = "0.13.0"
+nix-editor = "0.3.0"
+owo-colors = "4.1.0"
+regex = "1.11.1"
+sonic-rs = "0.3.17"
