@@ -18,7 +18,8 @@
 
         src = ./.;
 
-        cargoHash = "sha256-8e2n6Ys3VjJVQr5DObTG4HireviSQlX0q4JuJG/+XZ0=";
+        useFetchCargoVendor = true;
+        cargoHash = "sha256-r5tTeW9pddB1G65aXfj7tbV/EV/IdxaLTyurjLQXeUA=";
       };
 
       devShells.default = pkgs.mkShell {
