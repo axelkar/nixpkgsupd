@@ -1,295 +1,344 @@
 mod flake_nix;
-mod flake_ref;
-mod json_helpers;
 mod lockfile;
-mod registry;
+mod serde_int_tag_hack;
+mod sigint_guard;
+mod update;
 
 use std::{
-    collections::HashSet,
-    io::{stderr, stdin, IsTerminal, Write},
+    io::IsTerminal,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    time::{Duration, SystemTime},
 };
 
-use clap::{builder::ArgPredicate, Parser};
+use clap::{Args, Parser, Subcommand, builder::ArgPredicate};
 use color_eyre::{
-    eyre::{bail, Context, OptionExt},
     Result,
+    eyre::{Context, OptionExt, bail},
 };
-use flake_nix::set_flake_input_url;
 use fs_err as fs;
-use lockfile::{analyze_lockfile, AnalyzedLockfile};
-use owo_colors::{colors::xterm, OwoColorize};
-use registry::get_rev_from_registry;
+use iddqd::{IdHashItem, IdHashMap, id_hash_map::Entry as IdHashMapEntry};
+use owo_colors::{OwoColorize, colors::xterm};
+use serde::Deserialize;
 
-fn process_gcroot(
-    path: &Path,
-    visited: &mut HashSet<PathBuf>,
-    cli: &Cli,
-    global_rev: &str,
+use crate::lockfile::{AnalyzedLockfile, Locked, LockfileNode, Original, analyze_lockfile};
+
+struct Flake<'cli> {
+    // Currently just the flake ID passed in.
+    /// Key in `inputs`
+    id: &'cli str,
+    /// Parent of `flake.lock`
+    directory: PathBuf,
+    /// Paths of the gcroots. Below `directory`
+    gcroots: Vec<PathBuf>,
+    /// Whether the flake has build result gcroots
+    has_build_result: bool,
+    /// Whether the flake has direnv gcroots
+    has_direnv_gc_roots: bool,
+    /// Path of `flake.lock`
+    lockfile_path: PathBuf,
+}
+
+impl Flake<'_> {
+    pub fn in_git_repo(&self) -> bool {
+        self.directory
+            .ancestors()
+            .any(|path| path.join(".git").is_dir())
+    }
+}
+
+impl IdHashItem for Flake<'_> {
+    type Key<'a>
+        = &'a Path
+    where
+        Self: 'a;
+
+    fn key(&self) -> Self::Key<'_> {
+        &self.directory
+    }
+    iddqd::id_upcast!();
+}
+
+fn filter_gcroot<'cli>(
+    entry: &fs::DirEntry,
+    flakes: &mut IdHashMap<Flake<'cli>>,
+    flake_id: &'cli str,
 ) -> Result<()> {
-    if !path.exists() {
+    let gcroot = fs::read_link(entry.path())?;
+    if !gcroot.exists() {
         return Ok(());
     }
 
-    let Some((directory, is_direnv)) = {
-        path.ancestors()
+    let Some((directory, is_direnv, is_build_result)) = {
+        gcroot
+            .ancestors()
             .find(|path| path.file_name().is_some_and(|name| name == ".direnv"))
             .and_then(|direnv_path| direnv_path.parent())
-            .map(|path| (path, true))
+            .map(|path| (path, true, false))
     }
     .or_else(|| {
-        path.file_name()
-            .is_some_and(|name| name == "result")
-            .then(|| path.parent())
+        gcroot
+            .file_name()
+            .is_some_and(|name| name == "result" || name.as_encoded_bytes().starts_with(b"result-"))
+            .then(|| gcroot.parent())
             .flatten()
-            .map(|path| (path, false))
+            .map(|path| (path, false, true))
     }) else {
         return Ok(());
     };
 
-    let run_cmd = |program: &str, args: &[&str]| {
-        color_eyre::eyre::Ok(
-            Command::new(program)
-                .args(args)
-                .current_dir(directory)
-                .status()?
-                .success(),
-        )
-    };
+    match flakes.entry(directory) {
+        IdHashMapEntry::Occupied(mut occupied) => {
+            let mut existing = occupied.get_mut();
+            existing.gcroots.push(gcroot.clone());
+            existing.has_direnv_gc_roots |= is_direnv;
+            existing.has_build_result |= is_build_result;
+        }
+        IdHashMapEntry::Vacant(vacant) => {
+            let lockfile_path = directory.join("flake.lock");
+            if !lockfile_path.exists() {
+                return Ok(());
+            }
 
-    let lockfile_path = directory.join("flake.lock");
-    if !lockfile_path.exists() || visited.contains(directory) {
-        return Ok(());
+            vacant.insert(Flake {
+                id: flake_id,
+                directory: directory.to_owned(),
+                gcroots: vec![gcroot.clone()],
+                has_direnv_gc_roots: is_direnv,
+                has_build_result: is_build_result,
+                lockfile_path,
+            });
+        }
     }
 
-    visited.insert(directory.to_owned());
-
-    let Some(AnalyzedLockfile {
-        new_flake_ref,
-        allow_update,
-        local_rev,
-    }) = analyze_lockfile(&lockfile_path, global_rev, cli)?
-    else {
-        return Ok(());
-    };
-
-    println!(
-        "{}{}",
-        format_args!("{}: ", directory.display()).fg::<xterm::Gray>(),
-        local_rev.fg::<xterm::Red>()
-    );
-
-    let flake_nix = directory.join("flake.nix");
-    if !flake_nix.exists() {
-        bail!("flake.nix does not exist")
-    }
-    let flake_nix_contents = fs::read_to_string(&flake_nix)?;
-
-    let mut flake_nix_new_contents = new_flake_ref
-        .as_ref()
-        .map(|new_flake_ref| set_flake_input_url(new_flake_ref, &flake_nix_contents, cli))
-        .transpose()?;
-
-    loop {
-        if allow_update {
-            eprintln!("{}", "Note: The indirect reference can be updated".yellow());
-        }
-
-        eprint!(
-            "{}",
-            format_args!(
-                "Write this? [{}n,e,{}?] ",
-                flake_nix_new_contents
-                    .is_some()
-                    .then_some("y,")
-                    .unwrap_or_default(),
-                allow_update.then_some("u,").unwrap_or_default()
-            )
-            .blue()
-        );
-        stderr().flush()?;
-        let mut buf = String::new();
-        stdin().read_line(&mut buf)?;
-
-        match (buf.trim(), &flake_nix_new_contents) {
-            ("y", Some(contents)) => {
-                if !cli.allow_write {
-                    break;
-                }
-                fs::write(&flake_nix, contents)?;
-
-                if !run_cmd("nix", &["flake", "lock"])? {
-                    eprintln!("Failed to recreate lockfile. Try editing flake.nix.");
-                    flake_nix_new_contents = new_flake_ref
-                        .as_ref()
-                        .map(|new_flake_ref| {
-                            set_flake_input_url(new_flake_ref, &flake_nix_contents, cli)
-                        })
-                        .transpose()?;
-                    continue;
-                }
-            }
-            ("n", _) => {
-                eprintln!("{}", "Skipping this change".red());
-                break;
-            }
-            ("e", _) => {
-                if !cli.allow_write {
-                    break;
-                }
-                let status = Command::new(
-                    std::env::var_os("EDITOR").ok_or_eyre("EDITOR environment variable missing")?,
-                )
-                .arg(&flake_nix)
-                .status()?;
-                if !status.success() {
-                    eprintln!("{}", "Editor exited with nonzero exit code".red());
-                }
-
-                flake_nix_new_contents = new_flake_ref
-                    .as_ref()
-                    .map(|new_flake_ref| {
-                        set_flake_input_url(new_flake_ref, &flake_nix_contents, cli)
-                    })
-                    .transpose()?;
-
-                continue;
-            }
-            ("u", _) if allow_update => {
-                if !cli.allow_write {
-                    break;
-                }
-                if !run_cmd("nix", &["flake", "update", &cli.flake_id])? {
-                    eprintln!(
-                        "{}",
-                        "Failed to update indirect input. Try another method.".red()
-                    );
-                    continue;
-                }
-            }
-            _ => {
-                if new_flake_ref.is_some() {
-                    eprintln!("y - Write change and run `nix flake lock`");
-                }
-                eprintln!("n - Skip change");
-                eprintln!("e - Edit the file using $EDITOR. Make sure to copy the change first");
-                if allow_update {
-                    eprintln!(
-                        "u - Update an indirect reference by running `nix flake update {}`",
-                        cli.flake_id
-                    );
-                    eprintln!("    This is only supported by indirect references without rev or ref specifiers");
-                }
-                eprintln!("? - Print help");
-                continue;
-            }
-        }
-
-        if is_direnv {
-            eprint!("{}", "Update direnv? [y,n] ".blue());
-            stderr().flush()?;
-            let mut buf = String::new();
-            stdin().read_line(&mut buf)?;
-
-            match buf.trim() {
-                "y" if cli.allow_write => {
-                    if !run_cmd("direnv", &["exec", ".", "true"])? {
-                        eprintln!("{}", "Failed to reload direnv.".red());
-                        continue;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if directory.ancestors().any(|path| path.join(".git").is_dir()) {
-            let is_empty = !run_cmd("git", &["log", "-0"])?;
-            let stage_is_dirty = !run_cmd("git", &["diff", "--quiet", "--cached", "--exit-code"])?;
-
-            eprint!(
-                "{}{}{}{}{}",
-                "Commit ".blue(),
-                "flake.nix".blue().bold(),
-                " and ".blue(),
-                "flake.lock".blue().bold(),
-                " into Git? [y,n] ".blue()
-            );
-
-            if is_empty {
-                eprint!("{}", "(No commits yet) ".yellow());
-            }
-
-            if stage_is_dirty {
-                eprint!("{}", "(Stage is dirty) ".yellow());
-            }
-
-            stderr().flush()?;
-            let mut buf = String::new();
-            stdin().read_line(&mut buf)?;
-
-            match buf.trim() {
-                "y" if cli.allow_write => {
-                    if run_cmd("git", &["add", "flake.nix", "flake.lock"])? {
-                        if !run_cmd(
-                            "git",
-                            &[
-                                "commit",
-                                "-m",
-                                &format!("chore: bump flake input {}", cli.flake_id),
-                            ],
-                        )? {
-                            eprintln!("{}", "Failed to commit.".red());
-                        }
-                    } else {
-                        eprintln!("{}", "Failed to stage files.".red());
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        break;
-    }
-
-    eprintln!();
     Ok(())
 }
 
+/// `nix flake metadata --json` output
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NixFlakeMetadata {
+    //description: Option<String>,
+    //fingerprint: String,
+    // lastModified = locked.lastModified?
+    locked: Locked,
+    locks: lockfile::Lockfile,
+    //original: Original,
+    //original_url: String,
+    /// Equal to `original` except when `original` is indirect.
+    resolved: Original,
+    resolved_url: String,
+    // unused: url: String,
+}
+
+enum MatchTarget {
+    /// Target a flake's flake ref
+    FlakeMetadata(NixFlakeMetadata),
+    /// Target a flake's input's flake ref
+    FlakeInput {
+        input: LockfileNode,
+        flake_ref_url: String,
+    },
+}
+
+impl MatchTarget {
+    /// Returns the `locked` key.
+    const fn locked(&self) -> &Locked {
+        match self {
+            Self::FlakeMetadata(metadata) => &metadata.locked,
+            Self::FlakeInput { input, .. } => &input.locked,
+        }
+    }
+    /// Returns the `original` key.
+    const fn original(&self) -> &Original {
+        match self {
+            Self::FlakeMetadata(metadata) => &metadata.resolved,
+            Self::FlakeInput { input, .. } => &input.original.inner,
+        }
+    }
+    /// Returns the URL-like flake ref with `indirect` flakes resolved for [`MatchTarget::FlakeMetadata`].
+    fn flake_ref_url(&self) -> &str {
+        match self {
+            Self::FlakeMetadata(metadata) => &metadata.resolved_url,
+            Self::FlakeInput { flake_ref_url, .. } => flake_ref_url,
+        }
+    }
+}
+
+fn process_flake(
+    flake: &Flake,
+    cli: &Cli,
+    target: &MatchTarget,
+    flake_index: usize,
+    flakes_count: usize,
+) -> Result<()> {
+    match &cli.command {
+        CliCommand::List => {
+            let analyzed_lockfile = analyze_lockfile(&flake.lockfile_path, target, cli)?;
+
+            print_flake_info(flake, target, &analyzed_lockfile)?;
+        }
+        CliCommand::Update(update_args) => {
+            update::update_flake(flake, cli, target, flake_index, flakes_count, update_args)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn print_flake_info(
+    flake: &Flake<'_>,
+    target: &MatchTarget,
+    analyzed_lockfile: &AnalyzedLockfile,
+) -> Result<bool> {
+    print!("{}", flake.directory.display().fg::<xterm::Gray>(),);
+    if flake.has_direnv_gc_roots {
+        print!("{}", " (direnv)".green());
+    }
+    if flake.has_build_result {
+        print!("{}", " (build result)".green());
+    }
+    print!("{}", ":".fg::<xterm::Gray>(),);
+
+    let mut printed = false;
+
+    let ref_matches_target = analyzed_lockfile
+        .original
+        .ref_()
+        .is_some_and(|ref_| Some(ref_) == target.original().ref_());
+    if let Some(ref_) = analyzed_lockfile.original.ref_() {
+        let matches = target.original().ref_() == Some(ref_);
+        if matches {
+            if !printed {
+                print!(" {}", ref_.green());
+            }
+        } else {
+            print!(" {}", ref_.red());
+        }
+        printed = true;
+    }
+
+    let rev_matches_target = analyzed_lockfile
+        .locked
+        .rev()
+        .is_some_and(|rev| Some(rev) == target.locked().rev());
+    if let Some(rev) = analyzed_lockfile.locked.rev() {
+        let matches = target.locked().rev() == Some(rev);
+        if matches {
+            if !printed {
+                print!(" {}", rev.green());
+            }
+        } else {
+            print!(" {}", rev.red());
+        }
+        printed = true;
+    }
+
+    let url_matches_target = analyzed_lockfile
+        .locked
+        .url_no_git()
+        .is_some_and(|url| Some(url) == target.locked().url_no_git());
+    if let Some(url) = analyzed_lockfile.locked.url_no_git() {
+        let matches = target.locked().url_no_git() == Some(url);
+        if matches {
+            if !printed {
+                print!(" {}", url.green());
+            }
+        } else {
+            print!(" {}", url.red());
+        }
+    }
+
+    let timestamp_matches_target = match analyzed_lockfile.locked.last_modified() {
+        None => false,
+        Some(last_modified) => {
+            let last_modified = SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(last_modified))
+                .ok_or_eyre("Invalid last_modified; would overflow")?;
+            print!(
+                " {} {}",
+                "last updated".fg::<xterm::Gray>(),
+                chrono_humanize::HumanTime::from(last_modified).cyan(),
+            );
+            false // TODO!!!
+        }
+    };
+    println!();
+
+    // TODO: warn on indirect flakes!!
+
+    let matches_target = (ref_matches_target && timestamp_matches_target)
+        || rev_matches_target
+        || url_matches_target;
+    Ok(matches_target)
+}
+
+/// Nix garbage collector root flake updater
+///
+/// Looks for Nix garbage collector roots in `/nix/var/nix/gcroots/auto` and filters them for
+/// `.direnv/**`, `result` and `result-*`.
+///
+/// Then allows the user to execute operations on the found flakes interactively.
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version)]
 struct Cli {
-    /// The name of the flake in the Nix flake registry and as an input
-    #[arg(short, long, default_value = "nixpkgs")]
-    flake_id: String,
-    /// Sets a flake reference for an indirect
+    /// The name of the input to look for in flakes.
+    #[arg(long, default_value = "nixpkgs")]
+    input_id: String,
+
+    /// Target flake reference.
     ///
-    /// The rev/ref is optional and will be automatically fetched from the registry
+    /// This will be resolved using `nix flake metadata`.
     ///
-    /// Defaults to `github:NixOS/nixpkgs` when `flake_id` is set to `nixpkgs`
-    #[arg(short='r', long, default_value_if("flake_id", ArgPredicate::Equals("nixpkgs".into()), "github:NixOS/nixpkgs"))]
-    set_flake_ref: Option<String>,
-    /// Write to the files
+    /// Use a hash symbol to reference an input of a flake. For example: `./my-nixos-config#nixpkgs`.
+    ///
+    /// Defaults to `github:NixOS/nixpkgs/nixos-unstable` when `input-id` is set to `nixpkgs`.
+    #[arg(long, default_value_if("input_id", ArgPredicate::Equals("nixpkgs".into()), "github:NixOS/nixpkgs/nixos-unstable"))]
+    target: String,
+
+    #[command(subcommand)]
+    command: CliCommand,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    /// Lists the flakes and does not apply any operations on them.
+    List,
+    /// Updates Nix flake inputs based on a target.
+    ///
+    /// Updating only works when the new `nix` command is enabled.
+    Update(UpdateArgs),
+}
+
+#[derive(Args)]
+struct UpdateArgs {
+    /// Allows writing to files. This flag being unset means a dry run.
     #[arg(long)]
     allow_write: bool,
-    /// The number of lines to give as context in the idff.
+    /// The number of lines to give as context in the diff.
     #[arg(long, default_value_t = 3)]
     diff_context: usize,
+    // TODO: target vs flake-ref vs source??
+    // TODO: also support non-gcroot mode with more sources or destinations or targets or flakes!!!
+    // TODO: also support taking flakes by recursively finding flake.nix's
 }
 
 fn main() -> Result<()> {
     color_eyre::config::HookBuilder::default()
-        .theme(if !std::io::stderr().is_terminal() {
+        .theme(if std::io::stderr().is_terminal() {
+            color_eyre::config::Theme::dark()
+        } else {
             // Don't attempt color
             color_eyre::config::Theme::new()
-        } else {
-            color_eyre::config::Theme::dark()
         })
         .install()?;
 
-    let mut cli = Cli::parse();
+    let cli = Cli::parse();
 
-    if !cli.allow_write {
+    if let CliCommand::Update(UpdateArgs {
+        allow_write: false, ..
+    }) = cli.command
+    {
         println!(
             "{}{}",
             "Note: This is a dry run. To modify files and run commands, run again with "
@@ -299,51 +348,110 @@ fn main() -> Result<()> {
         );
     }
 
-    let rev =
-        get_rev_from_registry(&cli.flake_id).wrap_err("Failed to get rev from Nix registry")?;
-
-    if let Some(set_flake_ref) = &mut cli.set_flake_ref {
-        if !set_flake_ref.starts_with("github:")
-            && !set_flake_ref.starts_with("gitlab:")
-            && !set_flake_ref.starts_with("sourcehut:")
-        {
-            bail!("Unsupported set_flake_ref type")
+    let target = if let Some((flake_ref, input_id)) = cli.target.rsplit_once('#') {
+        let metadata = get_flake_ref_metadata(flake_ref)
+            .wrap_err("Failed to get metadata of flake reference")?;
+        let input = metadata
+            .locks
+            .extract_input(input_id)
+            .wrap_err("Failed to extract input of flake reference")?;
+        MatchTarget::FlakeInput {
+            flake_ref_url: get_flake_ref_url(&input)
+                .wrap_err("Failed to convert flake reference to URL-like format")?,
+            input,
         }
+    } else {
+        MatchTarget::FlakeMetadata(
+            get_flake_ref_metadata(&cli.target)
+                .wrap_err("Failed to get metadata of flake reference")?,
+        )
+    };
 
-        let set_has_rev = set_flake_ref.bytes().filter(|ch| *ch == b'/').count() >= 2;
-        if !set_has_rev {
-            set_flake_ref.push('/');
-            set_flake_ref.push_str(&rev);
+    print!("{} {}", cli.input_id.cyan(), "target:".fg::<xterm::Gray>(),);
+
+    if let Some(ref_) = target.original().ref_() {
+        print!(" {}", ref_.green());
+    } else if let Some(rev) = target.locked().rev() {
+        print!(" {}", rev.green());
+    } else if let Some(url) = target.locked().url_no_git() {
+        print!(" {}", url.green());
+    }
+
+    if let Some(last_modified) = target.locked().last_modified() {
+        let last_modified = SystemTime::UNIX_EPOCH + Duration::from_secs(last_modified);
+        print!(
+            " {} {}",
+            "last updated".fg::<xterm::Gray>(),
+            chrono_humanize::HumanTime::from(last_modified).cyan(),
+        );
+    }
+
+    println!();
+
+    let mut flakes = IdHashMap::new();
+
+    for entry in fs::read_dir("/nix/var/nix/gcroots/auto")? {
+        let entry = entry?;
+
+        if let Err(err) = filter_gcroot(&entry, &mut flakes, &cli.input_id)
+            .wrap_err_with(|| format!("Failed to filter gcroot {}", entry.path().display()))
+        {
+            eprintln!("{err:?}");
         }
     }
 
-    println!(
-        "{}{}",
-        "Global rev: ".fg::<xterm::Gray>(),
-        rev.fg::<xterm::Lime>()
-    );
-
-    let mut visited = HashSet::new();
-
-    for entry in fs::read_dir("/nix/var/nix/gcroots/auto")? {
-        let path = match (|| {
-            let entry = entry?;
-            color_eyre::eyre::Ok(fs::read_link(entry.path())?)
-        })() {
-            Ok(path) => path,
-            Err(err) => {
-                let err = err.wrap_err("Failed to process gcroot");
-                eprintln!("{err:?}");
-                continue;
-            }
-        };
-
-        if let Err(err) = process_gcroot(&path, &mut visited, &cli, &rev)
-            .wrap_err_with(|| format!("Failed to process gcroot {}", path.display()))
+    let flakes_count = flakes.len();
+    for (flake_index, flake) in flakes.into_iter().enumerate() {
+        if let Err(err) = process_flake(&flake, &cli, &target, flake_index, flakes_count)
+            .wrap_err_with(|| format!("Failed to process flake {}", flake.directory.display()))
         {
             eprintln!("{err:?}");
         }
     }
 
     Ok(())
+}
+
+fn get_flake_ref_metadata(flake_ref: &str) -> Result<NixFlakeMetadata> {
+    let output = {
+        let _guard = crate::sigint_guard::SigintGuard::new();
+
+        Command::new("nix")
+            .args(["flake", "metadata", "--json", "--", flake_ref])
+            .stdin(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .output()?
+    };
+
+    if !output.status.success() {
+        bail!("Command failed with {}", output.status);
+    }
+
+    serde_json::from_slice(&output.stdout).wrap_err("Failed to parse output")
+}
+
+fn get_flake_ref_url(input: &LockfileNode) -> Result<String> {
+    let json = serde_json::to_string(&input.original)?;
+    let output = {
+        // `--argstr` doesn't work at all with `nix eval`
+        Command::new("nix-instantiate")
+            .args([
+                "--eval",
+                "--expr",
+                "{ json }: builtins.flakeRefToString (builtins.fromJSON json)",
+                "--raw",
+                "--argstr",
+                "json",
+                &json,
+            ])
+            .stdin(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .output()?
+    };
+
+    if !output.status.success() {
+        bail!("Command failed with {}", output.status);
+    }
+
+    Ok(String::from_utf8(output.stdout)?)
 }

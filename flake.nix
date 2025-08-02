@@ -2,7 +2,7 @@
   description = "Nix garbage collector root flake updater";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -11,15 +11,13 @@
       pkgs = nixpkgs.legacyPackages.${system};
     in
     {
-      # The default package
-      packages.default = pkgs.rustPlatform.buildRustPackage rec {
+      packages.default = pkgs.rustPlatform.buildRustPackage {
         pname = "nixpkgsupd";
-        version = "0.1.0";
+        version = "0.2.0";
 
         src = ./.;
 
-        useFetchCargoVendor = true;
-        cargoHash = "sha256-r5tTeW9pddB1G65aXfj7tbV/EV/IdxaLTyurjLQXeUA=";
+        cargoLock.lockFile = ./Cargo.lock;
       };
 
       devShells.default = pkgs.mkShell {

@@ -1,97 +1,266 @@
-use std::{borrow::Cow, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
-use color_eyre::eyre::{bail, Context, OptionExt, Result};
-use fs_err as fs;
-use sonic_rs::JsonValueTrait;
+use color_eyre::eyre::{OptionExt, Result, WrapErr};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::{
-    flake_ref::git_hosting_svc_fmt,
-    json_helpers::{get_opt_json, get_three_pointers, get_two_pointers},
-    Cli,
-};
+use crate::{Cli, serde_int_tag_hack::Version};
 
-pub struct AnalyzedLockfile<'cli> {
-    pub new_flake_ref: Option<Cow<'cli, str>>,
-    pub allow_update: bool,
-    pub local_rev: String,
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum Lockfile {
+    V7 {
+        #[serde(rename = "version")]
+        _version: Version<7>,
+        #[serde(rename = "root")]
+        root_id: String,
+        #[serde(rename = "nodes")]
+        raw_nodes: HashMap<String, Value>,
+    },
+}
+impl Lockfile {
+    pub fn extract_input(self, input_id: &str) -> Result<LockfileNode> {
+        let Self::V7 {
+            root_id, raw_nodes, ..
+        } = self;
+        let raw_node = raw_nodes
+            .get(&root_id)
+            .and_then(|root_node| {
+                let child_id = root_node.get("inputs")?.get(input_id)?.as_str()?;
+                raw_nodes.get(child_id)
+            })
+            .ok_or_eyre("could not locate target node in lockfile")?;
+
+        let node =
+            serde_json::from_value(raw_node.clone()).wrap_err("failed to deserialize node")?;
+
+        Ok(node)
+    }
 }
 
-pub fn analyze_lockfile<'cli>(
+/// The shape of the one node we actually want to fully decode.
+#[derive(Deserialize, Debug)]
+pub struct LockfileNode {
+    pub locked: Locked,
+    pub original: OriginalExtra,
+}
+
+/// Description of the version currently used. [`LockfileNode::locked`]
+///
+/// <https://nix.dev/manual/nix/2.28/command-ref/new-cli/nix3-flake.html#types>
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(
+    tag = "type",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
+pub enum Locked {
+    Path {
+        path: String,
+        /// From flake inputs saved to the Nix registry using NixOS or home-manager
+        rev: Option<String>,
+        last_modified: u64,
+    },
+    Tarball {
+        url: String,
+        // Provided by server
+        rev: Option<String>,
+        // Provided by server
+        last_modified: Option<u64>,
+    },
+    Git {
+        /// The commit time of the revision `rev` as an integer denoting the number of seconds since 1970.
+        last_modified: Option<u64>,
+        /// You basically never want to use this. If it's specified by the user, it's in
+        /// [`Original`].
+        #[serde(rename = "ref")]
+        ref_: String,
+        rev: String,
+        shallow: Option<bool>,
+        url: String,
+    },
+    #[serde(untagged)]
+    GitService {
+        #[serde(rename = "type")]
+        type_: GitServiceType,
+        owner: String,
+        repo: String,
+        rev: String,
+        /// The commit time of the revision `rev` as an integer denoting the number of seconds since 1970.
+        last_modified: Option<u64>,
+        host: Option<String>,
+    },
+    #[serde(untagged)]
+    Other {
+        #[serde(rename = "type")]
+        type_: String,
+        rev: Option<String>,
+        url: Option<String>,
+        last_modified: Option<u64>,
+    },
+}
+impl Locked {
+    pub fn rev(&self) -> Option<&str> {
+        match self {
+            Self::Path { rev, .. } | Self::Tarball { rev, .. } | Self::Other { rev, .. } => {
+                rev.as_deref()
+            }
+            Self::GitService { rev, .. } | Self::Git { rev, .. } => Some(rev),
+        }
+    }
+    pub fn url_no_git(&self) -> Option<&str> {
+        match self {
+            Self::Tarball { url, .. } => Some(url),
+            Self::Path { .. } | Self::Git { .. } | Self::GitService { .. } | Self::Other { .. } => {
+                None
+            }
+        }
+    }
+    pub const fn last_modified(&self) -> Option<u64> {
+        match self {
+            Self::Path { last_modified, .. } => Some(*last_modified),
+            Self::Tarball { last_modified, .. }
+            | Self::Git { last_modified, .. }
+            | Self::GitService { last_modified, .. }
+            | Self::Other { last_modified, .. } => *last_modified,
+        }
+    }
+}
+
+/// Description of what was parsed from `flake.nix`. [`LockfileNode::original`]
+///
+/// Git services know whether a rev or ref was specified in `rev-or-ref`.
+///
+/// <https://nix.dev/manual/nix/2.28/command-ref/new-cli/nix3-flake.html#types>
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Original {
+    /// Performs a lookup of
+    ///
+    /// Form: `[flake:]<flake-id>(/<rev-or-ref>(/rev)?)?`
+    Indirect {
+        /// ID in the flake registry
+        id: String,
+        rev: Option<String>,
+        /// Example: `inputs.nixpkgs.url = "nixpkgs/nixos-unstable";`
+        #[serde(rename = "ref")]
+        ref_: Option<String>,
+    },
+    Path,
+    Tarball {
+        // url: String,
+    },
+    File,
+    Git {
+        // Either can be without the other
+        #[serde(rename = "ref")]
+        ref_: Option<String>,
+        // rev: Option<String>,
+        // shallow: Option<bool>,
+        // url: String,
+    },
+    Mercurial,
+
+    /// Form: `github:<owner>/<repo>(/<rev-or-ref>)?(\?<params>)?`
+    ///
+    /// `host` param is also supported
+    /// `flake` param is NOT supported
+    // TODO: extra params!!
+    #[serde(untagged)]
+    GitService {
+        #[serde(rename = "type")]
+        _type: GitServiceType,
+        //owner: String,
+        //repo: String,
+        // unused: host: Option<String>,
+        // unused: rev: Option<String>,
+        #[serde(rename = "ref")]
+        ref_: Option<String>,
+    },
+
+    #[serde(untagged)]
+    Other {
+        #[serde(rename = "type")]
+        type_: String,
+    },
+}
+impl Original {
+    pub fn ref_(&self) -> Option<&str> {
+        match self {
+            Self::Indirect { ref_, .. }
+            | Self::GitService { ref_, .. }
+            | Self::Git { ref_, .. } => ref_.as_deref(),
+            Self::Path
+            | Self::Tarball { .. }
+            | Self::File
+            | Self::Mercurial
+            | Self::Other { .. } => None,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "lowercase")]
+pub struct OriginalExtra {
+    #[serde(flatten)]
+    pub inner: Original,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum GitServiceType {
+    GitHub,
+    GitLab,
+    Sourcehut,
+}
+
+pub struct AnalyzedLockfile {
+    // TODO: use LockfileNode here
+    pub locked: Locked,
+    pub original: Original,
+}
+
+pub fn analyze_lockfile(
     path: &Path,
-    global_rev: &str,
-    cli: &'cli Cli,
-) -> Result<Option<AnalyzedLockfile<'cli>>> {
-    let lockfile_contents = fs::read(&path)?;
+    target: &crate::MatchTarget,
+    cli: &Cli,
+) -> Result<AnalyzedLockfile> {
+    let input_id = &cli.input_id;
+    let contents = fs::read(path)?;
+    let lockfile: Lockfile =
+        serde_json::from_slice(&contents).wrap_err("failed to parse top level of lockfile")?;
 
-    let (nodes, root, version) =
-        get_three_pointers(&*lockfile_contents, ["nodes"], ["root"], ["version"])?;
+    let node = lockfile.extract_input(input_id)?;
 
-    match version.as_u64().ok_or_eyre("Invalid lockfile")? {
-        7 => {}
-        num => bail!("Unsupported version {num}"),
+    if node
+        .locked
+        .rev()
+        .is_some_and(|rev| target.locked().rev() == Some(rev))
+        || node
+            .original
+            .inner
+            .ref_()
+            .is_some_and(|ref_| target.original().ref_() == Some(ref_))
+    {
+        return Ok(AnalyzedLockfile {
+            locked: node.locked,
+            original: node.original.inner,
+        });
     }
 
-    let root_node_id = root.as_str().ok_or_eyre("Invalid lockfile")?;
+    // TODO: no more analysis, at least for Indirect, because Nix removed support for updaing
+    // indirect from system/user registries, and Determinate Nix removed indirect entirely from
+    // flake.nix
 
-    let target_node_id = sonic_rs::get(nodes.as_raw_str(), [root_node_id, "inputs", &cli.flake_id])
-        .wrap_err("Missing target")?;
-    let target_node_id = target_node_id.as_str().ok_or_eyre("Invalid lockfile")?;
+    // Indirect: Cannot update if the rev or ref are overridden
+    //supports_update: rev.is_none() && ref_.is_none(),
+    // Tarball: Supports update if the server redirects the locked URL
+    //supports_update: url != locked_url,
 
-    let local_rev = sonic_rs::get(nodes.as_raw_str(), [target_node_id, "locked", "rev"])
-        .wrap_err("Invalid lockfile")?;
-    let local_rev = local_rev.as_str().ok_or_eyre("Invalid lockfile")?;
-
-    if local_rev == global_rev {
-        return Ok(None);
-    }
-
-    let original = sonic_rs::get(nodes.as_raw_str(), [target_node_id, "original"])
-        .wrap_err("Invalid lockfile")?;
-    let original_type =
-        sonic_rs::get(original.as_raw_str(), ["type"]).wrap_err("Invalid lockfile")?;
-    let original_type = original_type.as_str().ok_or_eyre("Invalid lockfile")?;
-
-    Ok(Some(match original_type {
-        "indirect" => {
-            // Input is either nonexistent or set to a registry flake id
-            let rev = get_opt_json(original.as_raw_str(), ["rev"]).wrap_err("Invalid lockfile")?;
-            let ref_ = get_opt_json(original.as_raw_str(), ["ref"]).wrap_err("Invalid lockfile")?;
-
-            AnalyzedLockfile {
-                new_flake_ref: cli.set_flake_ref.as_deref().map(Cow::Borrowed),
-                allow_update: rev.is_none() && ref_.is_none(),
-                local_rev: local_rev.to_owned(),
-            }
-        }
-        "path" | "tarball" | "file" => {
-            // Not supported
-            bail!("Type {original_type} is not supported")
-        }
-        "git" => {
-            bail!("Git is not yet implemented")
-        }
-        "mercurial" => {
-            // Not yet implemented
-            bail!("Mercurial is not yet implemented")
-        }
-        "github" | "gitlab" | "sourcehut" => {
-            let (owner, repo) = get_two_pointers(original.as_raw_str(), ["owner"], ["repo"])
-                .wrap_err("Invalid lockfile")?;
-            let owner = owner.as_str().ok_or_eyre("Invalid lockfile")?;
-            let repo = repo.as_str().ok_or_eyre("Invalid lockfile")?;
-
-            AnalyzedLockfile {
-                new_flake_ref: Some(Cow::Owned(git_hosting_svc_fmt(
-                    original_type,
-                    owner,
-                    repo,
-                    Some(global_rev),
-                    None,
-                ))),
-                allow_update: false,
-                local_rev: local_rev.to_owned(),
-            }
-        }
-        _ => bail!("Invalid lockfile"),
-    }))
+    Ok(AnalyzedLockfile {
+        locked: node.locked,
+        original: node.original.inner,
+    })
 }
