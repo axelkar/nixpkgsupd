@@ -1,6 +1,6 @@
 [package]
 name = "nixpkgsupd"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Axel Karjalainen <axel@axka.fi>"]
 edition = "2024"
 description = "Nix garbage collector root flake updater"
