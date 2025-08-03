@@ -15,7 +15,7 @@ use owo_colors::{OwoColorize, colors::xterm};
 
 use crate::{
     Flake, UpdateArgs, flake_nix::print_diff, flake_nix::replace_flake_input_url,
-    lockfile::analyze_lockfile, print_flake_info,
+    lockfile::load_lockfile_input, print_flake_info,
 };
 
 /// Runs the given command and returns whether it was successful.
@@ -46,8 +46,8 @@ pub fn update_flake(
 
     loop {
         println!();
-        let analyzed_lockfile = analyze_lockfile(&flake.lockfile_path, target, cli)?;
-        let lock_matches_target = print_flake_info(flake, target, &analyzed_lockfile)?;
+        let lockfile_node = load_lockfile_input(&flake.lockfile_path, cli)?;
+        let lock_matches_target = print_flake_info(flake, cli, target, &lockfile_node)?;
 
         let current_flake_nix = fs::read_to_string(&flake_nix)?;
 

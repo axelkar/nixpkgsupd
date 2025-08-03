@@ -216,17 +216,7 @@ pub enum GitServiceType {
     Sourcehut,
 }
 
-pub struct AnalyzedLockfile {
-    // TODO: use LockfileNode here
-    pub locked: Locked,
-    pub original: Original,
-}
-
-pub fn analyze_lockfile(
-    path: &Path,
-    target: &crate::MatchTarget,
-    cli: &Cli,
-) -> Result<AnalyzedLockfile> {
+pub fn load_lockfile_input(path: &Path, cli: &Cli) -> Result<LockfileNode> {
     let input_id = &cli.input_id;
     let contents = fs::read(path)?;
     let lockfile: Lockfile =
@@ -234,33 +224,5 @@ pub fn analyze_lockfile(
 
     let node = lockfile.extract_input(input_id)?;
 
-    if node
-        .locked
-        .rev()
-        .is_some_and(|rev| target.locked().rev() == Some(rev))
-        || node
-            .original
-            .inner
-            .ref_()
-            .is_some_and(|ref_| target.original().ref_() == Some(ref_))
-    {
-        return Ok(AnalyzedLockfile {
-            locked: node.locked,
-            original: node.original.inner,
-        });
-    }
-
-    // TODO: no more analysis, at least for Indirect, because Nix removed support for updaing
-    // indirect from system/user registries, and Determinate Nix removed indirect entirely from
-    // flake.nix
-
-    // Indirect: Cannot update if the rev or ref are overridden
-    //supports_update: rev.is_none() && ref_.is_none(),
-    // Tarball: Supports update if the server redirects the locked URL
-    //supports_update: url != locked_url,
-
-    Ok(AnalyzedLockfile {
-        locked: node.locked,
-        original: node.original.inner,
-    })
+    Ok(node)
 }
